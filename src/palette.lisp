@@ -29,5 +29,14 @@
 ;;; (egao1980/canvas-protocol#2); nothing in this backend changes when it lands.
 
 (defun palette-css (&optional (palette canvas:*chart-palette*))
-  (declare (ignore palette))
-  (%svg0-pending 'palette-css))
+  (check-type palette (and list (not null)))
+  (dolist (colour palette)
+    (unless (stringp colour)
+      (error 'type-error :datum colour :expected-type 'string)))
+  (with-output-to-string (s)
+    (loop for colour in palette
+          for n from 1
+          do (format s "figure[data-chart] [data-series=\"~D\"]:not([color]) { color: var(--chart-~D, " n n)
+             (write-string colour s)
+             (write-string "); }" s)
+             (terpri s))))

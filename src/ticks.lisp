@@ -74,14 +74,184 @@
 ;;;   ascending, only those within [d0, d1]). For :log with no automatic tick
 ;;;   inside [d0, d1], the ticks are d0 and d1.
 
+;;; ---------------------------------------------------------------- shared
+
+(defun %range (lo hi default-lo default-hi)
+  "LO / HI with NIL handling (both NIL -> the defaults, one NIL -> the other)
+and swapped into ascending order."
+  (let ((l (or lo hi default-lo))
+        (h (or hi lo default-hi)))
+    (if (> l h) (values h l) (values l h))))
+
+(defun %widen-d (v)
+  "NICE-TICKS' widening distance for the single value V."
+  (if (zerop v) 1 (/ (abs v) 10)))
+
+;;; ---------------------------------------------------------------- linear
+
+(defparameter +nice-round+ '((3/2 . 1) (3 . 2) (7 . 5))
+  "NICENUM with rounding: the first row whose bound F is below gives NF.")
+
+(defparameter +nice-ceiling+ '((1 . 1) (2 . 2) (5 . 5))
+  "NICENUM as a ceiling: the first row whose bound F is at or below gives NF.")
+
+(defun %nicenum (x roundp)
+  (let* ((e (%exponent x))
+         (p (expt 10 e))
+         (f (/ x p))
+         (row (if roundp
+                  (find-if (lambda (b) (< f (car b))) +nice-round+)
+                  (find-if (lambda (b) (<= f (car b))) +nice-ceiling+))))
+    (* (if row (cdr row) 10) p)))
+
 (defun nice-ticks (lo hi &key (count 5))
-  (declare (ignore lo hi count))
-  (%svg0-pending 'nice-ticks))
+  (check-type lo (or null real))
+  (check-type hi (or null real))
+  (check-type count (integer 2))
+  (multiple-value-bind (lo hi) (%range (and lo (%rat lo)) (and hi (%rat hi)) 0 1)
+    (when (= lo hi)
+      (let ((d (%widen-d lo)))
+        (setf lo (- lo d) hi (+ hi d))))
+    (let* ((step (%nicenum (/ (%nicenum (- hi lo) nil) (1- count)) t))
+           (nice-lo (* (floor lo step) step))
+           (nice-hi (* (ceiling hi step) step)))
+      (values (loop for v = nice-lo then (+ v step)
+                    while (<= v nice-hi) collect v)
+              nice-lo nice-hi step))))
+
+;;; ---------------------------------------------------------------- log
 
 (defun log-ticks (lo hi)
-  (declare (ignore lo hi))
-  (%svg0-pending 'log-ticks))
+  (check-type lo (or null (real (0))))
+  (check-type hi (or null (real (0))))
+  (multiple-value-bind (lo hi) (%range (and lo (%rat lo)) (and hi (%rat hi)) 1 10)
+    (let* ((nice-lo (expt 10 (%exponent lo)))
+           (nice-hi (let ((p (expt 10 (%exponent hi))))
+                      (if (= p hi) p (* p 10)))))
+      (when (= nice-lo nice-hi)
+        (setf nice-hi (* nice-lo 10)))
+      (values (loop for v = nice-lo then (* v 10)
+                    while (<= v nice-hi) collect v)
+              nice-lo nice-hi))))
+
+;;; ---------------------------------------------------------------- time
+
+(defparameter +time-candidates+
+  '((:second 1 1) (:second 2 2) (:second 5 5) (:second 10 10) (:second 15 15)
+    (:second 30 30)
+    (:minute 1 60) (:minute 2 120) (:minute 5 300) (:minute 10 600)
+    (:minute 15 900) (:minute 30 1800)
+    (:hour 1 3600) (:hour 3 10800) (:hour 6 21600) (:hour 12 43200)
+    (:day 1 86400) (:day 2 172800)
+    (:week 1 604800)
+    (:month 1 2629746) (:month 3 7889238) (:month 6 15778476))
+  "(unit step approximate-seconds), tried in order; the first whose tick count
+fits wins.")
+
+(defun %year-steps (span)
+  "1 2 5 10 20 50 ... up to the first step >= SPAN (so the last one always fits)."
+  (loop for k from 0
+        nconc (loop for m in '(1 2 5) collect (* m (expt 10 k))) into steps
+        until (>= (* 5 (expt 10 k)) (max 1 span))
+        finally (return steps)))
+
+(defun %ut-year (ut) (stack-datetime:date-year (%ut-date ut)))
+
+(defun %ut-month-index (ut)
+  (let ((date (%ut-date ut)))
+    (+ (* 12 (stack-datetime:date-year date)) (stack-datetime:date-month date) -1)))
+
+(defun %month-index-ut (i)
+  (multiple-value-bind (year m0) (floor i 12)
+    (%date-ut year (1+ m0))))
+
+(defun %year-ut (year) (%date-ut year 1))
+
+(defun %month-start-p (ut)
+  (= ut (%month-index-ut (%ut-month-index ut))))
+
+(defun %year-start-p (ut)
+  (= ut (%year-ut (%ut-year ut))))
+
+(defun %calendar-ticks (lo hi n ut->index index->ut start-p)
+  "Boundaries every N indices (months or years) from the greatest <= LO to the
+least >= HI."
+  (let* ((i0 (* n (floor (funcall ut->index lo) n)))
+         (j (if (funcall start-p hi)
+                (funcall ut->index hi)
+                (1+ (funcall ut->index hi))))
+         (i1 (* n (ceiling j n)))
+         (ticks (loop for i from i0 to i1 by n collect (funcall index->ut i))))
+    (values ticks (first ticks) (car (last ticks)))))
 
 (defun time-ticks (lo hi &key (count 5))
-  (declare (ignore lo hi count))
-  (%svg0-pending 'time-ticks))
+  (check-type lo (or null (integer 0)))
+  (check-type hi (or null (integer 0)))
+  (check-type count (integer 2))
+  (multiple-value-bind (lo hi) (%range lo hi 0 86400)
+    (when (= lo hi)
+      (setf hi (+ lo 86400)))
+    (let* ((span (- hi lo))
+           (row (find-if (lambda (r) (<= (/ span (third r)) count)) +time-candidates+)))
+      (cond
+        ((null row)
+         (let* ((y0 (%ut-year lo))
+                (y1 (if (%year-start-p hi) (%ut-year hi) (1+ (%ut-year hi))))
+                (n (find-if (lambda (n) (<= (/ (- y1 y0) n) count))
+                            (%year-steps (- y1 y0)))))
+           (multiple-value-bind (ticks nice-lo nice-hi)
+               (%calendar-ticks lo hi n #'%ut-year #'%year-ut #'%year-start-p)
+             (values ticks nice-lo nice-hi :year n))))
+        ((eq (first row) :month)
+         (let ((n (second row)))
+           (multiple-value-bind (ticks nice-lo nice-hi)
+               (%calendar-ticks lo hi n #'%ut-month-index #'%month-index-ut #'%month-start-p)
+             (values ticks nice-lo nice-hi :month n))))
+        (t
+         (destructuring-bind (unit step seconds) row
+           (let ((nice-lo (* seconds (floor lo seconds)))
+                 (nice-hi (* seconds (ceiling hi seconds))))
+             (values (loop for v from nice-lo to nice-hi by seconds collect v)
+                     nice-lo nice-hi unit step))))))))
+
+;;; ---------------------------------------------------------------- axis domain
+
+(defun %axis-domain (scale values amin amax &key exact)
+  "The renderer's axis domain (header rules above).
+-> (values d0 d1 automatic-ticks automatic-labeller). EXACT: the histogram's
+x axis, [lo, hi] from MIN / MAX or the data, not niced (linear)."
+  (let* ((vals (mapcar #'%rat values))
+         (amin (and amin (%rat amin)))
+         (amax (and amax (%rat amax)))
+         (lo (or amin (and vals (reduce #'min vals))))
+         (hi (or amax (and vals (reduce #'max vals)))))
+    ;; Exactly one bound, on or beyond the data: widen the free side from it.
+    (when (and (if amin (not amax) amax)
+               (or (null lo) (null hi) (>= lo hi)))
+      (let ((b (or amin amax))
+            (up (and amin t)))
+        (ecase (if exact :linear scale)
+          (:linear (if up (setf hi (+ b (%widen-d b))) (setf lo (- b (%widen-d b)))))
+          (:log (if up (setf hi (* b 10)) (setf lo (/ b 10))))
+          (:time (if up (setf hi (+ b 86400)) (setf lo (max 0 (- b 86400))))))))
+    (if exact
+        (let ((lo (or lo 0))
+              (hi (or hi 1)))
+          (when (= lo hi)
+            (setf lo (- lo 1/2) hi (+ hi 1/2)))
+          (multiple-value-bind (ticks nice-lo nice-hi step) (nice-ticks lo hi)
+            (declare (ignore nice-lo nice-hi))
+            (values lo hi ticks (lambda (v) (format-tick v step)))))
+        (ecase scale
+          (:linear
+           (multiple-value-bind (ticks nice-lo nice-hi step) (nice-ticks lo hi)
+             (values (or amin nice-lo) (or amax nice-hi) ticks
+                     (lambda (v) (format-tick v step)))))
+          (:log
+           (multiple-value-bind (ticks nice-lo nice-hi) (log-ticks lo hi)
+             (values (or amin nice-lo) (or amax nice-hi) ticks #'format-log-tick)))
+          (:time
+           (multiple-value-bind (ticks nice-lo nice-hi unit)
+               (time-ticks (and lo (max 0 (floor lo))) (and hi (max 0 (ceiling hi))))
+             (values (or amin nice-lo) (or amax nice-hi) ticks
+                     (lambda (v) (format-time-tick v unit)))))))))

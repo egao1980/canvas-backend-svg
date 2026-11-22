@@ -58,22 +58,111 @@
 (defconstant +rd-1900-01-01+ 693596
   "Rata Die of 1900-01-01, the epoch of CL universal time.")
 
+;;; ---------------------------------------------------------------- numbers
+
+(defun %rat (x)
+  "Exact value of the real X. Floats are RATIONALIZEd; a float of magnitude
+2^53 or more is integral, and RATIONAL gives its exact value there (1d20 ->
+10^20) where RATIONALIZE may pick a different integer."
+  (cond ((not (floatp x)) x)
+        ((>= (abs x) (expt 2 53)) (rational x))
+        (t (rationalize x))))
+
+(defun %exponent (x)
+  "X a positive rational -> the integer e with 10^e <= X < 10^(e+1)."
+  (let ((e 0))
+    (loop while (>= x 10) do (setf x (/ x 10)) (incf e))
+    (loop while (< x 1) do (setf x (* x 10)) (decf e))
+    e))
+
+(defun %power-of-ten (r)
+  "K when the rational R is exactly 10^K, else NIL."
+  (and (rationalp r) (plusp r)
+       (let ((k (%exponent r)))
+         (and (= r (expt 10 k)) k))))
+
+(defun %fixed (r decimals keep-zeros)
+  "The rational R as a fixed decimal with DECIMALS digits, rounded half away
+from zero. Without KEEP-ZEROS, trailing zeros and a trailing \".\" go. Never
+\"-0\"."
+  (let* ((scale (expt 10 decimals))
+         (n (floor (+ (* (abs r) scale) 1/2)))
+         (negative (and (minusp r) (plusp n))))
+    (multiple-value-bind (int frac) (floor n scale)
+      (let ((digits (if (zerop decimals) "" (format nil "~V,'0D" decimals frac))))
+        (unless keep-zeros
+          (setf digits (string-right-trim "0" digits)))
+        (concatenate 'string
+                     (if negative "-" "")
+                     (format nil "~D" int)
+                     (if (plusp (length digits)) "." "")
+                     digits)))))
+
 (defun format-number (value)
-  (declare (ignore value))
-  (%svg0-pending 'format-number))
+  (check-type value real)
+  (let ((r (%rat value)))
+    (if (integerp r)
+        (format nil "~D" r)
+        (%fixed r 6 nil))))
 
 (defun format-tick (value step)
-  (declare (ignore value step))
-  (%svg0-pending 'format-tick))
+  (check-type value real)
+  (check-type step (real (0)))
+  (let ((v (%rat value))
+        (e (%exponent (%rat step))))
+    (cond ((<= -4 e 5) (%fixed v (max 0 (- e)) t))
+          ((zerop v) "0")
+          (t (let ((k (%exponent (abs v))))
+               (concatenate 'string
+                            (%fixed (/ v (expt 10 k)) (max 0 (- k e)) nil)
+                            "e" (format nil "~D" k)))))))
 
 (defun format-log-tick (value)
-  (declare (ignore value))
-  (%svg0-pending 'format-log-tick))
+  (check-type value (real (0)))
+  (let* ((r (%rat value))
+         (k (%power-of-ten r)))
+    (cond ((null k) (format-number r))
+          ((<= 0 k 6) (format nil "~D" r))
+          ((<= -4 k -1) (%fixed r (- k) t))
+          (t (format nil "1e~D" k)))))
+
+;;; ---------------------------------------------------------------- calendar
+
+(defun %ut-date (ut)
+  "The datetime-protocol DATE of the universal time UT (UTC)."
+  (stack-datetime:date-from-rd (+ +rd-1900-01-01+ (floor ut 86400))))
+
+(defun %ut-fields (ut)
+  "UT -> year month day hour minute second, UTC."
+  (let ((date (%ut-date ut)))
+    (multiple-value-bind (h rest) (floor (mod ut 86400) 3600)
+      (multiple-value-bind (mi s) (floor rest 60)
+        (values (stack-datetime:date-year date) (stack-datetime:date-month date)
+                (stack-datetime:date-day date) h mi s)))))
+
+(defun %date-ut (year month &optional (day 1))
+  "Universal time of 00:00 UTC on YEAR-MONTH-DAY."
+  (* 86400 (- (stack-datetime:date-rd (stack-datetime:make-date year month day))
+              +rd-1900-01-01+)))
+
+(defun %ymd (year month day)
+  (format nil "~4,'0D-~2,'0D-~2,'0D" year month day))
 
 (defun format-time-tick (universal-time unit)
-  (declare (ignore universal-time unit))
-  (%svg0-pending 'format-time-tick))
+  (check-type universal-time (integer 0))
+  (check-type unit (member :second :minute :hour :day :week :month :year))
+  (multiple-value-bind (y mo d h mi s) (%ut-fields universal-time)
+    (let ((midnight (zerop (mod universal-time 86400))))
+      (ecase unit
+        (:year (format nil "~4,'0D" y))
+        (:month (format nil "~4,'0D-~2,'0D" y mo))
+        ((:day :week) (%ymd y mo d))
+        ((:hour :minute)
+         (if midnight (%ymd y mo d) (format nil "~2,'0D:~2,'0D" h mi)))
+        (:second
+         (if midnight (%ymd y mo d) (format nil "~2,'0D:~2,'0D:~2,'0D" h mi s)))))))
 
 (defun format-time (universal-time)
-  (declare (ignore universal-time))
-  (%svg0-pending 'format-time))
+  (check-type universal-time (integer 0))
+  (multiple-value-bind (y mo d h mi s) (%ut-fields universal-time)
+    (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D" y mo d h mi s)))

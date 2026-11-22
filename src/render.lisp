@@ -161,11 +161,371 @@
 (unless canvas:*chart-backend*
   (setf canvas:*chart-backend* *svg-backend*))
 
+;;; ---------------------------------------------------------------- ids, colours
+
+(defun %ascii-letter-p (c) (or (char<= #\a c #\z) (char<= #\A c #\Z)))
+(defun %ascii-digit-p (c) (char<= #\0 c #\9))
+(defun %hex-digit-p (c) (or (%ascii-digit-p c) (char<= #\a c #\f) (char<= #\A c #\F)))
+
+(defun %id-p (id)
+  "ID matches [A-Za-z][A-Za-z0-9_-]*."
+  (and (stringp id)
+       (plusp (length id))
+       (%ascii-letter-p (char id 0))
+       (every (lambda (c) (or (%ascii-letter-p c) (%ascii-digit-p c) (find c "_-"))) id)))
+
+(defparameter +colour-forms+
+  (list (lambda (c)                     ; #rgb or #rrggbb
+          (and (member (length c) '(4 7))
+               (char= (char c 0) #\#)
+               (every #'%hex-digit-p (subseq c 1))))
+        (lambda (c)                     ; a CSS colour name
+          (and (<= 1 (length c) 20)
+               (every (lambda (ch) (char<= #\a ch #\z)) c))))
+  "The accepted shapes of a series COLOR, one predicate each.")
+
+(defun %colour-p (c)
+  (and (stringp c) (find-if (lambda (p) (funcall p c)) +colour-forms+) t))
+
+(defun %kind-name (kind)
+  (string-downcase (symbol-name kind)))
+
+(defun %slug (title)
+  "Runs of characters other than ASCII [a-z0-9] -> one \"-\", trimmed, cut to
+32 characters, trimmed again."
+  (let ((s (with-output-to-string (out)
+             (let ((gap nil) (any nil))
+               (loop for ch across (string-downcase title)
+                     do (if (or (char<= #\a ch #\z) (%ascii-digit-p ch))
+                            (progn (when (and gap any) (write-char #\- out))
+                                   (write-char ch out)
+                                   (setf gap nil any t))
+                            (setf gap t)))))))
+    (string-trim "-" (subseq s 0 (min 32 (length s))))))
+
 (defun chart-id (chart)
-  (declare (ignore chart))
-  (%svg0-pending 'chart-id))
+  (let* ((title (canvas:chart-title chart))
+         (slug (if (stringp title) (%slug title) "")))
+    (concatenate 'string "chart-"
+                 (if (plusp (length slug)) slug (%kind-name (canvas:chart-kind chart))))))
+
+;;; ---------------------------------------------------------------- axes
+
+(defstruct (%ax (:constructor %make-ax (scale d0 d1 px0 px1 &optional ticks tip)))
+  "One axis: SCALE (:linear :log :time, or :band for bar x), domain [D0, D1],
+pixel ends PX0 (at D0) and PX1 (at D1), TICKS as (pixel . label) pairs in
+ascending value order, TIP the value printer for tooltips."
+  scale d0 d1 px0 px1 ticks tip)
+
+(defun %round (r)
+  (values (floor (+ r 1/2))))
+
+(defun %lg (x)
+  (or (%power-of-ten x) (/ (log (float x 1d0)) (log 10d0))))
+
+(defun %pos (ax v)
+  "The rounded pixel of the value V on AX (clamped into the domain)."
+  (let* ((d0 (%ax-d0 ax))
+         (d1 (%ax-d1 ax))
+         (v (max d0 (min d1 (%rat v))))
+         (u (if (eq (%ax-scale ax) :log)
+                (/ (- (%lg v) (%lg d0)) (- (%lg d1) (%lg d0)))
+                (/ (- v d0) (- d1 d0))))
+         (p (+ (%ax-px0 ax) (* u (- (%ax-px1 ax) (%ax-px0 ax))))))
+    (%round (rational p))))
+
+(defun %axis-printer (axis default)
+  "The printer of AXIS values: its FORMAT when given, else DEFAULT."
+  (let ((f (canvas:axis-format axis)))
+    (typecase f
+      (null default)
+      (string (lambda (v) (format nil f v)))
+      (t (lambda (v)
+           (let ((r (funcall f v)))
+             (if (stringp r)
+                 r
+                 (error 'canvas:canvas-error
+                        :message (format nil "axis format returned ~S, not a string" r)))))))))
+
+(defun %make-axis (axis scale values px0 px1 &key exact)
+  "Domain, ticks and printers of AXIS for VALUES, drawn from PX0 to PX1. Tick
+labels are made here, so a bad axis FORMAT signals before any mark is built."
+  (multiple-value-bind (d0 d1 auto labeller)
+      (%axis-domain scale values (canvas:axis-min axis) (canvas:axis-max axis) :exact exact)
+    (let* ((explicit (canvas:axis-ticks axis))
+           (inside (lambda (v) (<= d0 v d1)))
+           (ticks (remove-if-not inside
+                                 (if explicit
+                                     (sort (remove-duplicates (mapcar #'%rat explicit) :test #'=)
+                                           #'<)
+                                     auto)))
+           (ticks (if (and (eq scale :log) (null explicit) (null ticks))
+                      (list d0 d1)
+                      ticks))
+           (default-tip (if (eq scale :time) #'format-time #'format-number))
+           (label (%axis-printer axis (if explicit default-tip labeller)))
+           (ax (%make-ax scale d0 d1 px0 px1 nil (%axis-printer axis default-tip))))
+      (setf (%ax-ticks ax)
+            (mapcar (lambda (v) (cons (%pos ax v) (funcall label v))) ticks))
+      ax)))
+
+(defun %x-axis-group (ax yb label h)
+  (let ((x0 (%ax-px0 ax)) (x1 (%ax-px1 ax)))
+    (canvas:el :g nil
+               (canvas:el :line (list :x1 x0 :y1 yb :x2 x1 :y2 yb :stroke "currentColor"))
+               (loop for (p . text) in (%ax-ticks ax)
+                     collect (canvas:el :line (list :x1 p :y1 yb :x2 p :y2 (+ yb 6)
+                                                    :stroke "currentColor"))
+                     collect (canvas:el :text (list :x p :y (+ yb 20) :text-anchor "middle") text))
+               (when label
+                 (canvas:el :text (list :x (%round (/ (+ x0 x1) 2)) :y (- h 12)
+                                        :text-anchor "middle")
+                            label)))))
+
+(defun %y-axis-group (ax x0 label)
+  (let ((yb (%ax-px0 ax)) (yt (%ax-px1 ax)))
+    (canvas:el :g nil
+               (canvas:el :line (list :x1 x0 :y1 yb :x2 x0 :y2 yt :stroke "currentColor"))
+               (loop for (p . text) in (%ax-ticks ax)
+                     collect (canvas:el :line (list :x1 (- x0 6) :y1 p :x2 x0 :y2 p
+                                                    :stroke "currentColor"))
+                     collect (canvas:el :text (list :x (- x0 9) :y (+ p 4) :text-anchor "end") text))
+               (when label
+                 (canvas:el :text (list :transform (format nil "translate(16,~D) rotate(-90)"
+                                                           (%round (/ (+ yb yt) 2)))
+                                        :text-anchor "middle")
+                            label)))))
+
+;;; ---------------------------------------------------------------- marks
+
+(defun %points (series)
+  (coerce (canvas:series-points series) 'list))
+
+(defun %tip (series i default)
+  "The tooltip of point I: the series' label when it has LABELS, else DEFAULT
+\(a function of no arguments)."
+  (let ((labels (canvas:series-labels series)))
+    (if labels (elt labels i) (funcall default))))
+
+(defun %titled (tag attrs tip)
+  (canvas:el tag attrs (canvas:el :title nil tip)))
+
+(defun %xy-tip (ax ay x y)
+  (lambda ()
+    (concatenate 'string (funcall (%ax-tip ax) (%rat x)) ", " (funcall (%ax-tip ay) (%rat y)))))
+
+(defun %line-marks (series ax ay)
+  (let ((points (%points series)))
+    (append
+     (when (cdr points)
+       (list (canvas:el :polyline
+                        (list :points (format nil "~{~D,~D~^ ~}"
+                                              (loop for (x . y) in points
+                                                    collect (%pos ax x) collect (%pos ay y)))
+                              :fill "none" :stroke "currentColor" :stroke-width 2))))
+     (loop for (x . y) in points
+           for i from 0
+           collect (%titled :circle (list :cx (%pos ax x) :cy (%pos ay y) :r 3
+                                          :fill "currentColor")
+                            (%tip series i (%xy-tip ax ay x y)))))))
+
+(defun %scatter-marks (series ax ay)
+  (loop for (x . y) in (%points series)
+        for i from 0
+        collect (%titled :circle (list :cx (%pos ax x) :cy (%pos ay y) :r 4 :fill "currentColor")
+                         (%tip series i (%xy-tip ax ay x y)))))
+
+(defun %base (ay)
+  "The value bars grow from: 0 clamped into the domain (d0 for :log)."
+  (if (eq (%ax-scale ay) :log)
+      (%ax-d0 ay)
+      (max (%ax-d0 ay) (min (%ax-d1 ay) 0))))
+
+(defun %bar-rect (left right v ay tip)
+  (let* ((base (%base ay))
+         (top (%pos ay (max v base)))
+         (bottom (%pos ay (min v base))))
+    (%titled :rect (list :x left :y top :width (- right left) :height (- bottom top)
+                         :fill "currentColor")
+             tip)))
+
+(defun %categories (all-series)
+  (let ((cats '()))
+    (dolist (s all-series (nreverse cats))
+      (dolist (p (%points s))
+        (pushnew (car p) cats :test #'string=)))))
+
+(defun %bar-marks (series si nseries cats x0 bw ay)
+  (let ((w (/ (* 8/10 bw) nseries)))
+    (loop for (cat . v) in (%points series)
+          for i from 0
+          for c = (position cat cats :test #'string=)
+          collect (let ((left (+ x0 (* c bw) (/ bw 10) (* si w))))
+                    (%bar-rect (%round left) (%round (+ left w)) (%rat v) ay
+                               (%tip series i
+                                     (let ((cat cat) (v v))
+                                       (lambda ()
+                                         (concatenate 'string cat ", "
+                                                      (funcall (%ax-tip ay) (%rat v)))))))))))
+
+(defun %bin-counts (values lo hi bins)
+  "A list of BINS counts of VALUES over [LO, HI]; values outside are not counted."
+  (let ((counts (make-array bins :initial-element 0)))
+    (dolist (v values (coerce counts 'list))
+      (let ((v (%rat v)))
+        (when (<= lo v hi)
+          (incf (aref counts (min (1- bins) (floor (* (- v lo) bins) (- hi lo))))))))))
+
+(defun %histogram-marks (counts si nseries bins ax ay)
+  (let* ((lo (%ax-d0 ax))
+         (width (/ (- (%ax-d1 ax) lo) bins))
+         (share (/ width nseries)))
+    (loop for count in counts
+          for k from 0
+          collect (let* ((a (+ lo (* k width)))
+                         (b (+ a width))
+                         (left (+ a (* si share))))
+                    (%bar-rect (%pos ax left) (%pos ax (+ left share)) count ay
+                               (concatenate 'string (funcall (%ax-tip ax) a) " to "
+                                            (funcall (%ax-tip ax) b) ": "
+                                            (format nil "~D" count)))))))
+
+(defun %series-group (series index marks)
+  (canvas:el :g (list :data-series (1+ (mod index (length canvas:*chart-palette*)))
+                      :color (canvas:series-color series))
+             marks))
+
+(defun %legend (all-series x0)
+  (let ((cx x0))
+    (canvas:el :g nil
+               (loop for s in all-series
+                     for i from 0
+                     for name = (canvas:series-name s)
+                     collect (canvas:el :rect (list :data-series (1+ (mod i (length canvas:*chart-palette*)))
+                                                    :color (canvas:series-color s)
+                                                    :x cx :y 6 :width 10 :height 10
+                                                    :fill "currentColor"))
+                     collect (canvas:el :text (list :x (+ cx 14) :y 16) name)
+                     do (incf cx (+ 14 (* 7 (length name)) 16))))))
+
+;;; ---------------------------------------------------------------- tree
+
+(defparameter +kind-texts+
+  '((:line "Line chart" "point")
+    (:bar "Bar chart" "bar")
+    (:scatter "Scatter chart" "point")
+    (:histogram "Histogram" "value"))
+  "kind -> (default title, desc noun).")
+
+(defun %description (chart label noun)
+  (or (canvas:chart-description chart)
+      (let ((series (canvas:chart-series chart)))
+        (format nil "~A of ~D series: ~{~A~^, ~}." label (length series)
+                (loop for s in series
+                      for n = (length (canvas:series-points s))
+                      collect (format nil "~A (~D ~A~P)" (canvas:series-name s) n noun n))))))
+
+(defun %legend-p (chart)
+  (let ((legend (canvas:chart-legend chart)))
+    (or (eq legend t)
+        (and (eq legend :auto) (cdr (canvas:chart-series chart)) t))))
+
+(defun %series-values (series key)
+  (loop for s in series nconc (mapcar key (%points s))))
+
+(defun %plot (chart x0 x1 yb yt)
+  "-> (values x-axis y-axis series-groups) for CHART in the plot box."
+  (let* ((kind (canvas:chart-kind chart))
+         (series (canvas:chart-series chart))
+         (xa (canvas:chart-x-axis chart))
+         (ya (canvas:chart-y-axis chart))
+         (y-scale (canvas:axis-scale ya))
+         (zero (if (eq y-scale :log) '() (list 0))))
+    (ecase kind
+      ((:line :scatter)
+       (let ((ax (%make-axis xa (canvas:axis-scale xa) (%series-values series #'car) x0 x1))
+             (ay (%make-axis ya y-scale (%series-values series #'cdr) yb yt)))
+         (values ax ay
+                 (loop for s in series for i from 0
+                       collect (%series-group s i (if (eq kind :line)
+                                                      (%line-marks s ax ay)
+                                                      (%scatter-marks s ax ay)))))))
+      (:bar
+       (let* ((cats (%categories series))
+              (bw (/ (- x1 x0) (max 1 (length cats))))
+              (ax (%make-ax :band 0 1 x0 x1
+                            (loop for cat in cats for c from 0
+                                  collect (cons (%round (+ x0 (* c bw) (/ bw 2))) cat))))
+              (ay (%make-axis ya y-scale (append (%series-values series #'cdr) zero) yb yt))
+              (n (length series)))
+         (values ax ay
+                 (loop for s in series for i from 0
+                       collect (%series-group s i (%bar-marks s i n cats x0 bw ay))))))
+      (:histogram
+       (let* ((bins (canvas:chart-bins chart))
+              (ax (%make-axis xa :linear (%series-values series #'identity) x0 x1 :exact t))
+              (counts (loop for s in series
+                            collect (%bin-counts (%points s) (%ax-d0 ax) (%ax-d1 ax) bins)))
+              (ay (%make-axis ya y-scale
+                              (append (if (eq y-scale :log)
+                                          (remove-if-not #'plusp (reduce #'append counts))
+                                          (reduce #'append counts))
+                                      zero)
+                              yb yt))
+              (n (length series)))
+         (values ax ay
+                 (loop for s in series for c in counts for i from 0
+                       collect (%series-group s i (%histogram-marks c i n bins ax ay)))))))))
+
+(defun %figure (chart id)
+  (let* ((kind (canvas:chart-kind chart))
+         (texts (rest (assoc kind +kind-texts+)))
+         (title (or (canvas:chart-title chart) (first texts)))
+         (w (canvas:chart-width chart))
+         (h (canvas:chart-height chart))
+         (x-label (canvas:axis-label (canvas:chart-x-axis chart)))
+         (y-label (canvas:axis-label (canvas:chart-y-axis chart)))
+         (legendp (%legend-p chart))
+         (x0 (if y-label 72 56))
+         (x1 (max (- w 16) (1+ x0)))
+         (yt (if legendp 40 16))
+         (yb (max (- h (if x-label 56 40)) (1+ yt))))
+    (multiple-value-bind (ax ay groups) (%plot chart x0 x1 yb yt)
+      (canvas:el :figure (list :data-chart (%kind-name kind))
+                 (stack-html:make-html-element
+                  "svg"
+                  :attributes (list (cons "id" id)
+                                    (cons "viewBox" (format nil "0 0 ~D ~D" w h))
+                                    (cons "role" "img")
+                                    (cons "aria-labelledby"
+                                          (concatenate 'string id "-title " id "-desc"))
+                                    (cons "fill" "currentColor")
+                                    (cons "font-family" "sans-serif")
+                                    (cons "font-size" "12"))
+                  :children (canvas:render
+                             (list (canvas:el :title (list :id (concatenate 'string id "-title"))
+                                              title)
+                                   (canvas:el :desc (list :id (concatenate 'string id "-desc"))
+                                              (%description chart (first texts) (second texts)))
+                                   (%x-axis-group ax yb x-label h)
+                                   (%y-axis-group ay x0 y-label)
+                                   groups
+                                   (when legendp (%legend (canvas:chart-series chart) x0)))))
+                 (when (canvas:chart-title chart)
+                   (canvas:el :figcaption nil (canvas:chart-title chart)))))))
+
+;;; ---------------------------------------------------------------- entry
 
 (defmethod canvas:render-chart ((backend svg-backend) chart &key id)
-  (declare (ignore id))
   (canvas:validate-chart chart)
-  (%svg0-pending 'render-chart))
+  (let ((id (or id (chart-id chart))))
+    (unless (%id-p id)
+      (error 'canvas:canvas-error :message (format nil "invalid chart id ~S" id)))
+    (dolist (s (canvas:chart-series chart))
+      (let ((c (canvas:series-color s)))
+        (when (and c (not (%colour-p c)))
+          (error 'canvas:invalid-chart
+                 :field :series
+                 :reason (format nil "series ~S: colour ~S is not #rgb, #rrggbb or a lowercase name"
+                                 (canvas:series-name s) c)))))
+    (%figure chart id)))
