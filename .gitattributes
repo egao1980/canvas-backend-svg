@@ -1,0 +1,7 @@
+# Byte-exact sources on every OS: golden SVG strings live in tests/*.lisp,
+# and a CRLF checkout on Windows would change them.
+* text=auto eol=lf
+*.lisp text eol=lf
+*.asd text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
