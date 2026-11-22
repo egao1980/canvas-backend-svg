@@ -5,8 +5,9 @@
 ;;; or the implementation's float printer. Bind the printer variables to their
 ;;; standard values (or use ~D with explicit arguments) inside each function.
 ;;;
-;;; Exact arithmetic: a float argument is first converted with RATIONALIZE
-;;; (0.1d0 -> 1/10); integers and ratios are used as they are. "Exponent of x"
+;;; Exact arithmetic: a float argument is first converted to the shortest
+;;; decimal that reads back as it (%RAT; 0.1d0 -> 1/10, not RATIONALIZE, whose
+;;; result differs between implementations); integers and ratios are used as they are. "Exponent of x"
 ;;; (x > 0) is the integer e with 10^e <= x < 10^(e+1), found exactly on
 ;;; rationals (no LOG). "Round" is half away from zero on the magnitude:
 ;;; (floor (+ |x| 1/2)), sign put back after; a result of zero prints without
@@ -60,13 +61,51 @@
 
 ;;; ---------------------------------------------------------------- numbers
 
+(defun %shortest-decimal (x)
+  "The shortest decimal (as a rational) that lies strictly inside the rounding
+interval of the finite, non-zero float X -- so it reads back as X on any
+implementation. Computed from INTEGER-DECODE-FLOAT with integer arithmetic
+only (Steele-White / dragon4 idea), so it does not depend on the
+implementation's RATIONALIZE or float printer."
+  (multiple-value-bind (m e sign) (integer-decode-float x)
+    ;; Normalise: implementations decode subnormals differently (SBCL keeps
+    ;; the short mantissa, ECL shifts it to full length), so derive the ulp
+    ;; from the value and the format's limits rather than from E alone.
+    (let* ((v (* m (expt 2 e)))
+           (double (typep x 'double-float))
+           (tiny (rational (if double least-positive-double-float
+                               least-positive-single-float)))
+           (least-normal (rational (if double least-positive-normalized-double-float
+                                       least-positive-normalized-single-float)))
+           (ulp (max tiny (expt 2 (+ e (integer-length m) (- (float-digits x))))))
+           (half-up (/ ulp 2))
+           ;; Above the least normal, a power of two has half the gap below.
+           (half-down (if (and (> v least-normal) (= m (expt 2 (1- (integer-length m)))))
+                          (/ ulp 4)
+                          half-up))
+           (lo (- v half-down))
+           (hi (+ v half-up))
+           (k (%exponent v)))
+      (flet ((inside (r) (and (< lo r) (< r hi))))
+        (loop for digits from 1
+              for scale = (expt 10 (- digits 1 k))
+              for near = (/ (floor (+ (* v scale) 1/2)) scale)
+              for other = (if (< near v)
+                              (/ (ceiling (* v scale)) scale)
+                              (/ (floor (* v scale)) scale))
+              do (cond ((inside near) (return (* sign near)))
+                       ((inside other) (return (* sign other)))))))))
+
 (defun %rat (x)
-  "Exact value of the real X. Floats are RATIONALIZEd; a float of magnitude
-2^53 or more is integral, and RATIONAL gives its exact value there (1d20 ->
-10^20) where RATIONALIZE may pick a different integer."
+  "Exact value of the real X. A float becomes the shortest decimal that reads
+back as it (0.1d0 -> 1/10, 0.002d0 -> 1/500), identical on every
+implementation (RATIONALIZE is not: ECL returns the binary value). A float of
+magnitude 2^53 or more is integral, and RATIONAL gives its exact value there
+(1d20 -> 10^20)."
   (cond ((not (floatp x)) x)
+        ((zerop x) 0)
         ((>= (abs x) (expt 2 53)) (rational x))
-        (t (rationalize x))))
+        (t (%shortest-decimal x))))
 
 (defun %exponent (x)
   "X a positive rational -> the integer e with 10^e <= X < 10^(e+1)."

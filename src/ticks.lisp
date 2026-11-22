@@ -1,7 +1,7 @@
 (in-package #:canvas-backend-svg)
 
 ;;; Ticks and domains. All exact (rationals), so every implementation produces
-;;; the same numbers. Floats are RATIONALIZEd first (see format.lisp).
+;;; the same numbers. Floats go through %RAT first (see format.lisp).
 ;;;
 ;;; NICE-TICKS lo hi &key (count 5) -> (values ticks nice-lo nice-hi step)
 ;;;   Heckbert's loose labelling ("Nice numbers for graph labels", Graphics
@@ -70,7 +70,7 @@
 ;;;   :linear -> NICE-TICKS lo hi; :log -> LOG-TICKS; :time -> TIME-TICKS.
 ;;;   Domain d0 = MIN if given else nice-lo; d1 = MAX if given else nice-hi.
 ;;;   Tick values = the computed ticks within [d0, d1]; when the axis has
-;;;   explicit TICKS, those instead (RATIONALIZEd, duplicates removed, sorted
+;;;   explicit TICKS, those instead (through %RAT, duplicates removed, sorted
 ;;;   ascending, only those within [d0, d1]). For :log with no automatic tick
 ;;;   inside [d0, d1], the ticks are d0 and d1.
 
